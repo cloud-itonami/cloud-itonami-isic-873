@@ -103,47 +103,57 @@
                :record (commit-record request context proposal)
                :audit [(commit-fact request context proposal)]}))))
 
-      ;; Branch: :hold -> END, :escalate -> APPROVAL gate, :commit -> LEDGER-APPEND
-      (g/add-conditional-edges :decide
-        (fn [{:keys [disposition]}]
-          (case disposition
-            :hold :end
-            :escalate :request-approval
-            :commit :append-ledger
-            :end))
-        {:end :end :request-approval :request-approval :append-ledger :append-ledger})
-
-      ;; Request-approval node: pause for human review. Resumes via
-      ;; `{:approval {:status :approved}}` or `{:status :rejected}`.
+      ;; Approval handoff -- paused by interrupt-before; a human operator
+      ;; resumes with :approval. Then route commit/hold.
       (g/add-node :request-approval
-        (fn [s] {:audit [{:t :awaiting-approval
-                          :op (get-in s [:request :op])
-                          :resident-id (get-in s [:request :resident-id])}]}))
+        (fn [{:keys [request context proposal approval verdict]}]
+          (if (= :approved (:status approval))
+            {:disposition :commit
+             :record (assoc (commit-record request context proposal)
+                            :payload (assoc (:value proposal)
+                                            :approved-by (:by approval)))
+             :audit [{:t :approval-granted :op (:op request)
+                      :resident-id (:resident-id request) :by (:by approval)}]}
+            {:disposition :hold
+             :audit [(merge (governor/hold-fact request context
+                                                (assoc verdict :violations
+                                                       [{:rule :approver-rejected}]))
+                            {:t :approval-rejected})]})))
 
-      ;; Branch from request-approval (resume point).
-      (g/add-conditional-edges :request-approval
-        (fn [{:keys [approval]}]
-          (when approval
-            (case (:status approval)
-              :approved :append-ledger
-              :rejected :end)))
-        {:append-ledger :append-ledger :end :end})
+      ;; Commit -- the ONLY node that writes the SSoT + audit ledger.
+      (g/add-node :commit
+        (fn [{:keys [request context proposal record]}]
+          (store/commit-record! store record)
+          (let [f (commit-fact request context proposal)]
+            (store/append-ledger! store f)
+            {:audit [f]})))
 
-      ;; Append-ledger node: persist the approved/auto-committed record.
-      (g/add-node :append-ledger
-        (fn [{:keys [record audit] :as s}]
-          (when record (store/commit-record! store record))
-          (doseq [fact audit] (store/append-ledger! store fact))
-          {:audit audit}))
+      ;; Hold -- write the rejection to the ledger; no SSoT mutation.
+      (g/add-node :hold
+        (fn [{:keys [audit]}]
+          (when-let [hf (last (filter #(#{:governor-hold :approval-rejected} (:t %)) audit))]
+            (store/append-ledger! store (assoc hf :disposition :hold)))
+          {}))
 
-      ;; END node (sink).
-      (g/add-node :end (fn [s] s))
-
-      ;; Edges
       (g/set-entry-point :intake)
       (g/add-edge :intake :advise)
       (g/add-edge :advise :govern)
       (g/add-edge :govern :decide)
-      (g/add-edge :append-ledger :end)
 
-      (g/compile checkpointer)))
+      (g/add-conditional-edges :decide
+        (fn [{:keys [disposition]}]
+          (case disposition
+            :commit   :commit
+            :escalate :request-approval
+            :hold)))
+
+      (g/add-conditional-edges :request-approval
+        (fn [{:keys [disposition]}]
+          (if (= :commit disposition) :commit :hold)))
+
+      (g/set-finish-point :commit)
+      (g/set-finish-point :hold)
+
+      (g/compile-graph
+       {:checkpointer     checkpointer
+        :interrupt-before #{:request-approval}})))
