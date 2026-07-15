@@ -43,12 +43,18 @@
     (let [{:keys [disposition]} (phase/gate 3 {:op :schedule-staff-shift-proposal} :commit)]
       (is (= :commit disposition)))))
 
-(deftest safety-concern-never-auto-commits
-  (testing ":flag-safety-concern ALWAYS escalates when governor says escalate, at all phases"
-    (doseq [ph [0 1 2 3]]
+(deftest safety-concern-holds-when-not-enabled
+  (testing ":flag-safety-concern holds in phases 0-2 (not yet enabled)"
+    (doseq [ph [0 1 2]]
       (let [{:keys [disposition]} (phase/gate ph {:op :flag-safety-concern} :escalate)]
-        (is (= :escalate disposition)
-            (str "phase " ph " must escalate safety concerns"))))))
+        (is (= :hold disposition)
+            (str "phase " ph " has not enabled flag-safety-concern yet"))))))
+
+(deftest safety-concern-escalates-when-enabled
+  (testing ":flag-safety-concern ALWAYS escalates when enabled, even if governor says commit"
+    (let [{:keys [disposition]} (phase/gate 3 {:op :flag-safety-concern} :commit)]
+      (is (= :escalate disposition)
+          "phase 3 must escalate safety concerns regardless of governor disposition"))))
 
 (deftest hard-hold-always-wins
   (testing "a governor HARD hold stays HOLD regardless of phase"
