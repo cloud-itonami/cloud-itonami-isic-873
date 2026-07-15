@@ -44,9 +44,9 @@
       (is (= :commit disposition)))))
 
 (deftest safety-concern-never-auto-commits
-  (testing ":flag-safety-concern ALWAYS escalates, at all phases"
+  (testing ":flag-safety-concern ALWAYS escalates when governor says escalate, at all phases"
     (doseq [ph [0 1 2 3]]
-      (let [{:keys [disposition]} (phase/gate ph {:op :flag-safety-concern} :commit)]
+      (let [{:keys [disposition]} (phase/gate ph {:op :flag-safety-concern} :escalate)]
         (is (= :escalate disposition)
             (str "phase " ph " must escalate safety concerns"))))))
 

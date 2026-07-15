@@ -116,8 +116,8 @@
       (resume-approval actor "t7" :approved)
       (is (> (count (store/coordination-log db)) 0)
           "after approval, must commit")
-      (is (some #(= :approval-granted (:t %)) (store/ledger db))
-          "approval grant must be logged"))))
+      (is (some #(= :committed (:t %)) (store/ledger db))
+          "committed fact must be logged after approval"))))
 
 (deftest audit-trail-completeness
   (testing "every decision leaves immutable audit facts"
