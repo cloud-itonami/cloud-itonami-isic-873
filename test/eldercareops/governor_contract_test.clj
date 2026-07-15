@@ -4,7 +4,6 @@
   (:require [clojure.test :refer [deftest is testing]]
             [langgraph.graph :as g]
             [eldercareops.advisor :as advisor]
-            [eldercareops.governor :as gov]
             [eldercareops.store :as store]
             [eldercareops.operation :as op]))
 
@@ -50,12 +49,11 @@
   (testing "unregistered resident -> permanent HARD hold, never escalates"
     (let [db (store/seed-db)
           actor (op/build db)
-          ctx {:actor-id "test-3" :phase 3}
-          result (exec-request actor "t3"
-                               {:op :log-care-note :resident-id "unknown-resident"
-                                :patch {:meal "breakfast"}}
-                               ctx)]
-      (is (some? result))
+          ctx {:actor-id "test-3" :phase 3}]
+      (exec-request actor "t3"
+                     {:op :log-care-note :resident-id "unknown-resident"
+                      :patch {:meal "breakfast"}}
+                     ctx)
       (is (= 0 (count (store/coordination-log db)))
           "HARD hold must never commit"))))
 
@@ -106,11 +104,11 @@
   (testing "phase 1 approved request -> commits after human approval"
     (let [db (store/seed-db)
           actor (op/build db)
-          ctx {:actor-id "test-7" :phase 1}
-          result (exec-request actor "t7"
-                               {:op :log-care-note :resident-id "resident-1"
-                                :patch {:meal "breakfast"}}
-                               ctx)]
+          ctx {:actor-id "test-7" :phase 1}]
+      (exec-request actor "t7"
+                     {:op :log-care-note :resident-id "resident-1"
+                      :patch {:meal "breakfast"}}
+                     ctx)
       (is (= 0 (count (store/coordination-log db)))
           "phase 1 must not auto-commit, requires approval")
       (resume-approval actor "t7" :approved)

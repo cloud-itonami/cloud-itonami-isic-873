@@ -1,8 +1,7 @@
 (ns eldercareops.phase-test
   "Unit tests of `eldercareops.phase` rollout logic."
   (:require [clojure.test :refer [deftest is testing]]
-            [eldercareops.phase :as phase]
-            [eldercareops.governor :as gov]))
+            [eldercareops.phase :as phase]))
 
 (def clean-verdict {:hard? false :escalate? false})
 (def low-conf-verdict {:hard? false :escalate? true})
