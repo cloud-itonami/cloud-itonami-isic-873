@@ -38,9 +38,17 @@
   THROWS if that count is zero -- a console for a governed actor that
   never shows the governor saying no is a brochure, not evidence.
 
+  It THROWS a second time if the run did not exercise every rule in
+  `governor-hard-rules`. Counting holds alone is a weak invariant: five
+  holds that all fire the same rule prove one check works and say
+  nothing about the other three. The coverage gate fails closed -- add a
+  HARD rule to the governor without a scenario that reaches it and this
+  build stops.
+
   Usage: `clojure -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [clojure.java.io :as io]
+            [clojure.set :as set]
             [clojure.string :as str]
             [langgraph.graph :as g]
             [eldercareops.advisor :as advisor]
@@ -50,6 +58,20 @@
             [eldercareops.store :as store]))
 
 (def ^:private coordinator "care-coordinator-1")
+
+(def ^:private governor-hard-rules
+  "Every rule `eldercareops.governor` can emit from a HARD check:
+  `resident-unverified-violations` emits one, `effect-not-propose-violations`
+  one, and `scope-exclusion-violations` emits either `:op-not-allowed`
+  (op off the closed allowlist) or `:scope-excluded` (content touching an
+  excluded decision area) -- three check functions, four rules.
+
+  `-main` requires the rendered run to exercise ALL of them. Not listed
+  here: `:approver-rejected`, which `eldercareops.operation` synthesizes
+  for a human rejection. That fact is written with `:t :approval-rejected`,
+  so it is a reversible human decision rather than a governor HARD block,
+  and `hard-hold?` correctly keeps it out of this set."
+  #{:resident-unverified :effect-not-propose :op-not-allowed :scope-excluded})
 
 (defn- ctx [ph] {:actor-id "coord-1" :actor-role :care-coordinator :phase ph})
 
@@ -133,7 +155,13 @@
     :request {:op :log-care-note :resident-id "resident-1"
               :out-of-scope? true :patch {}}
     :expect :hold
-    :intent "advisor が投薬・ケアプラン領域へ逸脱 — HARD hold（永久・override 不可）"}])
+    :intent "advisor が投薬・ケアプラン領域へ逸脱 — HARD hold（永久・override 不可）"}
+
+   {:tid "t13" :phase 3 :actor :unauthorized-op
+    :request {:op :administer-medication :resident-id "resident-1"
+              :patch {:meal "breakfast" :mood "calm"}}
+    :expect :hold
+    :intent "closed allowlist の外の op を advisor が提案 — HARD hold（override 不可）"}])
 
 (defn- direct-actuation-advisor
   "An advisor that claims direct actuation instead of a proposal --
@@ -142,6 +170,29 @@
   (reify advisor/Advisor
     (-advise [_ _ req] (assoc (advisor/infer nil req) :effect :commit))))
 
+(defn- unauthorized-op-advisor
+  "An advisor that proposes an op it was never authorized to propose --
+  the failure mode `eldercareops.governor`'s docstring names alongside
+  scope drift and folds into the same HARD check.
+
+  Nothing here is invented prose. It asks the repo's OWN advisor for a
+  well-formed `:log-care-note` proposal against the same seeded resident
+  and relabels ONLY `:op`, so exactly one variable differs from the
+  clean run at `t2`. `:effect` stays `:propose` and the resident stays
+  verified, which isolates `:op-not-allowed` from the other two HARD
+  checks instead of tripping several at once.
+
+  Note the short-circuit this exposes: the request op
+  `:administer-medication` also puts `medic` into the text blob that
+  `scope-exclusion-violations` scans, but that function is a `cond` whose
+  allowlist branch is tested first, so the reported rule is
+  `:op-not-allowed` and never `:scope-excluded`."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req]
+      (assoc (advisor/infer nil (assoc req :op :log-care-note))
+             :op (:op req)))))
+
 (defn run-scenario!
   "Drives every step above through the real compiled StateGraph against
   one freshly seeded store. Returns {:db .. :runs [{:step .. :state ..}]}
@@ -149,7 +200,8 @@
   []
   (let [db (store/seed-db)
         actors {:default (op/build db)
-                :direct  (op/build db {:advisor (direct-actuation-advisor)})}
+                :direct  (op/build db {:advisor (direct-actuation-advisor)})
+                :unauthorized-op (op/build db {:advisor (unauthorized-op-advisor)})}
         runs (doall
               (for [{:keys [tid phase actor request approve reject] :as step} scenario]
                 (let [a (get actors actor)
@@ -206,6 +258,12 @@
   (and (= :governor-hold (:t f)) (empty? (:violations f))))
 
 (defn- hard-holds [ledger] (filterv hard-hold? ledger))
+
+(defn- exercised-rules
+  "The distinct HARD rules this run actually drove the governor to emit,
+  read back out of the ledger rather than declared."
+  [ledger]
+  (into (sorted-set) (for [f (hard-holds ledger), v (:violations f)] (:rule v))))
 
 (defn- outcome-cell [{:keys [state]}]
   (let [audit (:audit state)
@@ -477,7 +535,8 @@
         stored (vec (store/coordination-log db))
         approver-rows (approver-audit runs stored)
         self-tripping (finding-self-tripping-ops)
-        n-hard (count (hard-holds ledger))]
+        n-hard (count (hard-holds ledger))
+        rules (exercised-rules ledger)]
     (str
      "<!doctype html>\n<html lang=\"ja\"><head><meta charset=\"utf-8\">\n"
      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
@@ -515,7 +574,12 @@
      "    <h2>HARD hold 一覧（" n-hard " 件 · override 不可）</h2>\n"
      "    <p class=\"muted\">"
      "governor の 3 つの HARD チェックによる拒否。人間の承認でも覆せず、承認画面にすら到達しない。"
-     "段階ロールアウトによる hold は違反を伴わないため、ここには現れない。</p>\n"
+     "段階ロールアウトによる hold は違反を伴わないため、ここには現れない。<br>"
+     "この実行が実際に発火させた規則: "
+     (str/join "、" (for [r rules] (str "<code>" (esc (name r)) "</code>")))
+     "（" (count rules) "/" (count governor-hard-rules) "）。"
+     "件数ではなく<em>網羅</em>が生成条件で、未発火の規則が 1 つでもあれば "
+     "<code>-main</code> は書き込みを拒否して失敗する。</p>\n"
      "    <table>\n"
      "      <thead><tr><th>op</th><th>入居者</th><th>規則</th><th>理由</th></tr></thead>\n"
      "      <tbody>\n" (hold-rows ledger) "\n      </tbody>\n"
@@ -584,6 +648,8 @@
         {:keys [db runs] :as result} (run-scenario!)
         ledger (vec (store/ledger db))
         n-hard (count (hard-holds ledger))
+        rules (exercised-rules ledger)
+        missing (set/difference governor-hard-rules rules)
         html (render result)]
     (when (zero? n-hard)
       (throw (ex-info (str "refusing to write " out
@@ -591,9 +657,19 @@
                            "A console for a governed actor that never shows the governor "
                            "saying no is a brochure, not evidence.")
                       {:out out :ledger-facts (count ledger) :hard-holds 0})))
+    ;; Coverage, not just count: holds that all fire one rule prove one
+    ;; check works and say nothing about the rest. Fails closed.
+    (when (seq missing)
+      (throw (ex-info (str "refusing to write " out
+                           ": the scenario never drove the governor to emit "
+                           (str/join ", " (map name (sort missing)))
+                           ". Every HARD rule must be demonstrated, not just counted.")
+                      {:out out :exercised (vec rules) :missing (vec (sort missing))})))
     (io/make-parents out)
     (spit out html)
     (println "wrote" out
              (str "(" (count runs) " runs, " (count ledger) " ledger facts, "
-                  n-hard " HARD holds, "
+                  n-hard " HARD holds covering " (count rules) "/"
+                  (count governor-hard-rules) " governor rules ["
+                  (str/join " " (map name rules)) "], "
                   (count (store/coordination-log db)) " committed records)"))))
