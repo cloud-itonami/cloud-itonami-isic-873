@@ -16,10 +16,13 @@
     - the phase matrix is read out of `eldercareops.phase/phases`
     - the action gate is derived from `governor/allowed-ops`,
       `governor/always-escalate-ops` and each phase's `:auto` set
-    - the two findings at the bottom are MEASURED from this very run,
+    - the three findings at the bottom are MEASURED from this very run,
       by re-deriving them from the actor's own vocabulary. They are not
       hard-coded notices: fix the underlying behaviour and they change
-      or disappear on the next regeneration.
+      or disappear on the next regeneration. The first of them compares
+      each step's DECLARED `:expect` against what the actor actually
+      did, so a scenario step whose demonstration has quietly stopped
+      working is reported on the page instead of read past.
 
   PROVENANCE. Every resident id and name comes from
   `eldercareops.store/demo-data`. Every request payload is copied
@@ -79,8 +82,10 @@
 ;;
 ;; Each step is one supervised graph run. Requests are verbatim from
 ;; `eldercareops.sim`; `:intent` records what the step is here to
-;; demonstrate, and is compared against the actor's ACTUAL disposition
-;; when the page is rendered (see `finding-intent-drift`).
+;; demonstrate and `:expect` records the disposition it was written to
+;; produce. Both are compared against the actor's ACTUAL disposition
+;; when the page is rendered (see `finding-intent-drift`), so a step
+;; whose demonstration stops working is reported instead of read past.
 
 (def ^:private scenario
   [{:tid "t1" :phase 1 :actor :default :approve coordinator
@@ -259,6 +264,27 @@
 
 (defn- hard-holds [ledger] (filterv hard-hold? ledger))
 
+(defn- actual-disposition
+  "Classifies a finished run in the scenario's own `:expect` vocabulary
+  (`:commit` | `:hold`), reading the run's OWN final audit fact rather
+  than any declaration. Deliberately the same tail-of-`:audit` reading
+  the run table's outcome cell uses, so the drift finding below can
+  never disagree with the table above it."
+  [{:keys [state]}]
+  (if (= :committed (:t (last (:audit state)))) :commit :hold))
+
+(defn- outcome-reason
+  "Plain-text (un-escaped) reason for a run's final disposition."
+  [{:keys [state]}]
+  (let [f (last (:audit state))]
+    (cond
+      (hard-hold? f) (str "HARD hold · " (str/join ", " (map (comp name :rule) (:violations f))))
+      (phase-hold? f) (str "phase hold · " (kw-name (:phase-reason f)))
+      (= :approval-rejected (:t f)) "人間が却下"
+      (= :committed (:t f)) (if (some #(= :approval-granted (:t %)) (:audit state))
+                              "承認のうえ commit" "auto-commit")
+      :else (kw-name (:disposition state)))))
+
 (defn- exercised-rules
   "The distinct HARD rules this run actually drove the governor to emit,
   read back out of the ledger rather than declared."
@@ -324,6 +350,35 @@
                  hits (when proposal (seq (scope-hits proposal)))]
            :when hits]
        {:op op :proposal proposal :hits (vec hits)}))))
+
+(defn- finding-intent-drift
+  "MEASURED: every scenario step declares `:expect` -- what the step was
+  written to demonstrate. This compares that declaration against what the
+  actor ACTUALLY did on this run and returns the mismatches.
+
+  This function is the reason `:expect` exists. Until Wave 15 the scenario
+  carried `:expect` on all 13 steps, a comment promised they were
+  `compared against the actor's ACTUAL disposition`, and nothing read
+  them -- a check that is documented but never runs returns the same
+  silence as a check that ran and found nothing. It was hiding a real
+  mismatch (`t4`).
+
+  Drift is DISCLOSED, not thrown on, and the declaration is not quietly
+  rewritten to match reality: a step whose demonstration was defeated by
+  a genuine defect is exactly the thing a reader needs to see. Fix the
+  underlying behaviour and the row disappears on the next regeneration."
+  [runs]
+  (vec
+   (for [{:keys [step] :as r} runs
+         :let [expected (:expect step)
+               actual (actual-disposition r)]
+         :when (and expected (not= expected actual))]
+     {:tid (:tid step)
+      :op (get-in step [:request :op])
+      :expected expected
+      :actual actual
+      :reason (outcome-reason r)
+      :intent (:intent step)})))
 
 (defn- approver-audit
   "MEASURED: for each committed run, compare the record the actor handed
@@ -470,12 +525,39 @@
              :else (tag "muted" "—"))
            (if-let [c (:confidence f)] (esc c) (tag "muted" "—"))]))))
 
-(defn- findings-html [self-tripping approver-rows]
+(defn- drift-html [drift]
+  (if (seq drift)
+    (str "    <div class=\"finding\">\n"
+         "      <h3>所見 · 宣言した想定と実際の挙動がずれている（" (count drift) " 件）</h3>\n"
+         "      <p>各 step は「何を実演するか」を <code>:expect</code> として宣言している。"
+         "この実行では次の step が宣言どおりに動いていない。</p>\n"
+         "      <table>\n"
+         "        <thead><tr><th>thread</th><th>op</th><th>宣言</th><th>実際</th><th>この step の意図</th></tr></thead>\n"
+         "        <tbody>\n"
+         (rows (for [{:keys [tid op expected actual reason intent]} drift]
+                 (row [(str "<code>" (esc tid) "</code>")
+                       (str "<code>" (esc (name op)) "</code>")
+                       (tag "muted" (esc (kw-name expected)))
+                       (tag "critical" (str (esc (kw-name actual)) " · " (esc reason)))
+                       (esc intent)])))
+         "\n        </tbody>\n"
+         "      </table>\n"
+         "    </div>\n")
+    (str "    <div class=\"finding clear\">\n"
+         "      <h3>所見 · 全 step が宣言どおりの disposition を返している</h3>\n"
+         "      <p>各 step の <code>:expect</code> と実際の disposition を突き合わせた結果、"
+         "ずれは 0 件。</p>\n"
+         "    </div>\n")))
+
+(defn- findings-html [drift self-tripping approver-rows]
   (let [drop-rows (filterv #(= :dropped (:retained %)) approver-rows)
         value-carried (filterv #(and (= :retained (:retained %))
                                      (not (some #{:value} (:fields %))))
                                approver-rows)]
     (str
+     ;; Finding 0 -- declared intent vs. what the actor actually did.
+     (drift-html drift)
+     "\n"
      ;; Finding 1 -- derived from the governor's own vocabulary.
      (if (seq self-tripping)
        (str/join
@@ -534,6 +616,7 @@
   (let [ledger (vec (store/ledger db))
         stored (vec (store/coordination-log db))
         approver-rows (approver-audit runs stored)
+        drift (finding-intent-drift runs)
         self-tripping (finding-self-tripping-ops)
         n-hard (count (hard-holds ledger))
         rules (exercised-rules ledger)]
@@ -633,7 +716,7 @@
      "    <p class=\"muted\">"
      "以下は固定文ではなく、この実行の actor の語彙と store の中身から毎回導出している。"
      "原因が直れば次回生成時に自動的に消える。</p>\n"
-     (findings-html self-tripping approver-rows)
+     (findings-html drift self-tripping approver-rows)
      "  </section>\n"
      "</main>\n"
      "<footer>\n"

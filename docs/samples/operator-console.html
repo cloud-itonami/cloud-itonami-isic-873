@@ -150,6 +150,17 @@ border-radius:4px;padding:2px 10px;font-size:.8rem}
     <h2>この実行から導出した所見</h2>
     <p class="muted">以下は固定文ではなく、この実行の actor の語彙と store の中身から毎回導出している。原因が直れば次回生成時に自動的に消える。</p>
     <div class="finding">
+      <h3>所見 · 宣言した想定と実際の挙動がずれている（1 件）</h3>
+      <p>各 step は「何を実演するか」を <code>:expect</code> として宣言している。この実行では次の step が宣言どおりに動いていない。</p>
+      <table>
+        <thead><tr><th>thread</th><th>op</th><th>宣言</th><th>実際</th><th>この step の意図</th></tr></thead>
+        <tbody>
+        <tr><td><code>t4</code></td><td><code>coordinate-supply-request</code></td><td><span class="muted">commit</span></td><td><span class="critical">hold · HARD hold · scope-excluded</span></td><td>非医薬品（寝具リネン）の調達調整 — allowlist 内の op、phase 3 の auto 対象</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="finding">
       <h3>所見 · <code>coordinate-supply-request</code> は自分自身の但し書きで恒久的に HARD hold される</h3>
       <p>この op は closed allowlist の一員だが、advisor が生成する定型文が governor の scope 除外語彙に一致するため、内容にかかわらず commit できない。一致した語: <code>薬</code>（:rationale 内）</p>
       <p class="muted">該当箇所: 「布製品・移動補助具・食料品などの非医薬品消耗品の調達調整のみ。投薬なし。」 — これは投薬が<em>ない</em>ことを述べた否定文だが、部分文字列走査は肯定的な言及と区別できない。走査が否定を扱えるようになるか語彙が変われば、この所見は次回生成時に自動的に消える。</p>
