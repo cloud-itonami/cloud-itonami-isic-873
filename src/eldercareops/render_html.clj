@@ -1,0 +1,758 @@
+(ns eldercareops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Every row on the emitted page is produced by driving the REAL actor
+  stack -- `eldercareops.operation` (a langgraph-clj StateGraph) ->
+  `eldercareops.advisor` -> `eldercareops.governor` ->
+  `eldercareops.phase` -> `eldercareops.store` -- over this repo's own
+  seeded resident directory. Nothing is hand-typed prose about what the
+  actor *would* do:
+
+    - the resident table is `store/all-residents`
+    - the run table is the final `:disposition` + `:audit` channel of
+      each real `g/run*`
+    - the SSoT table is `store/coordination-log`
+    - the ledger table is `store/ledger`
+    - the phase matrix is read out of `eldercareops.phase/phases`
+    - the action gate is derived from `governor/allowed-ops`,
+      `governor/always-escalate-ops` and each phase's `:auto` set
+    - the three findings at the bottom are MEASURED from this very run,
+      by re-deriving them from the actor's own vocabulary. They are not
+      hard-coded notices: fix the underlying behaviour and they change
+      or disappear on the next regeneration. The first of them compares
+      each step's DECLARED `:expect` against what the actor actually
+      did, so a scenario step whose demonstration has quietly stopped
+      working is reported on the page instead of read past.
+
+  PROVENANCE. Every resident id and name comes from
+  `eldercareops.store/demo-data`. Every request payload is copied
+  verbatim from this repo's own demo driver `eldercareops.sim`
+  (`clojure -M:dev:run`, run and read BEFORE this file was written).
+  `resident-99` is the one id deliberately NOT in the directory; it is
+  taken from `sim` too and exists only to exercise the governor's
+  `resident-unverified` HARD block against an absent record. No
+  resident, quantity, caregiver, date or hold reason is invented here.
+
+  Deterministic: no timestamps, no randomness, every set and map sorted
+  explicitly before it is printed. Two consecutive runs are
+  byte-identical.
+
+  `-main` counts the HARD `:governor-hold` entries it rendered and
+  THROWS if that count is zero -- a console for a governed actor that
+  never shows the governor saying no is a brochure, not evidence.
+
+  It THROWS a second time if the run did not exercise every rule in
+  `governor-hard-rules`. Counting holds alone is a weak invariant: five
+  holds that all fire the same rule prove one check works and say
+  nothing about the other three. The coverage gate fails closed -- add a
+  HARD rule to the governor without a scenario that reaches it and this
+  build stops.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.java.io :as io]
+            [clojure.set :as set]
+            [clojure.string :as str]
+            [langgraph.graph :as g]
+            [eldercareops.advisor :as advisor]
+            [eldercareops.governor :as governor]
+            [eldercareops.operation :as op]
+            [eldercareops.phase :as phase]
+            [eldercareops.store :as store]))
+
+(def ^:private coordinator "care-coordinator-1")
+
+(def ^:private governor-hard-rules
+  "Every rule `eldercareops.governor` can emit from a HARD check:
+  `resident-unverified-violations` emits one, `effect-not-propose-violations`
+  one, and `scope-exclusion-violations` emits either `:op-not-allowed`
+  (op off the closed allowlist) or `:scope-excluded` (content touching an
+  excluded decision area) -- three check functions, four rules.
+
+  `-main` requires the rendered run to exercise ALL of them. Not listed
+  here: `:approver-rejected`, which `eldercareops.operation` synthesizes
+  for a human rejection. That fact is written with `:t :approval-rejected`,
+  so it is a reversible human decision rather than a governor HARD block,
+  and `hard-hold?` correctly keeps it out of this set."
+  #{:resident-unverified :effect-not-propose :op-not-allowed :scope-excluded})
+
+(defn- ctx [ph] {:actor-id "coord-1" :actor-role :care-coordinator :phase ph})
+
+;; ----------------------------- scenario -----------------------------
+;;
+;; Each step is one supervised graph run. Requests are verbatim from
+;; `eldercareops.sim`; `:intent` records what the step is here to
+;; demonstrate and `:expect` records the disposition it was written to
+;; produce. Both are compared against the actor's ACTUAL disposition
+;; when the page is rendered (see `finding-intent-drift`), so a step
+;; whose demonstration stops working is reported instead of read past.
+
+(def ^:private scenario
+  [{:tid "t1" :phase 1 :actor :default :approve coordinator
+    :request {:op :log-care-note :resident-id "resident-1"
+              :patch {:meal "lunch eaten" :mood "cheerful" :activity "art class"}}
+    :expect :commit
+    :intent "phase 1 は全書き込みが承認必須 — 人間が承認して commit"}
+
+   {:tid "t2" :phase 3 :actor :default
+    :request {:op :log-care-note :resident-id "resident-1"
+              :patch {:meal "dinner eaten" :mood "calm" :activity "card game"}}
+    :expect :commit
+    :intent "phase 3 の auto 対象 op、governor clean → 自動 commit"}
+
+   {:tid "t3" :phase 3 :actor :default
+    :request {:op :schedule-family-visit :resident-id "resident-1"
+              :patch {:visitor-name "daughter Sarah" :date "2026-07-20" :time "14:00"}}
+    :expect :commit
+    :intent "phase 3 の auto 対象 op、governor clean → 自動 commit"}
+
+   {:tid "t4" :phase 3 :actor :default
+    :request {:op :coordinate-supply-request :resident-id "resident-1"
+              :patch {:item "bed linens" :quantity 2 :urgency "routine"}}
+    :expect :commit
+    :intent "非医薬品（寝具リネン）の調達調整 — allowlist 内の op、phase 3 の auto 対象"}
+
+   {:tid "t5" :phase 3 :actor :default
+    :request {:op :schedule-staff-shift-proposal :resident-id "resident-1"
+              :patch {:caregiver "nurse tech Chen" :shift "morning" :date "2026-07-21"}}
+    :expect :commit
+    :intent "phase 3 の auto 対象 op、governor clean → 自動 commit"}
+
+   {:tid "t6" :phase 3 :actor :default :approve coordinator
+    :request {:op :flag-safety-concern :resident-id "resident-1"
+              :patch {:concern "resident reported loss of balance near bathroom"
+                      :confidence 0.92}}
+    :expect :commit
+    :intent "安全懸念は phase 3 でも決して自動化されない — 人間が確認して承認"}
+
+   {:tid "t7" :phase 3 :actor :default :reject coordinator
+    :request {:op :flag-safety-concern :resident-id "resident-1"
+              :patch {:concern "resident reported loss of balance near bathroom"
+                      :confidence 0.92}}
+    :expect :hold
+    :intent "同じ安全懸念を人間が却下 — 人間の否認も監査事実として残る（HARD hold ではない）"}
+
+   {:tid "t8" :phase 1 :actor :default
+    :request {:op :schedule-family-visit :resident-id "resident-1"
+              :patch {:visitor-name "daughter Sarah" :date "2026-07-20" :time "14:00"}}
+    :expect :hold
+    :intent "phase 1 は care-note しか書けない — 段階ロールアウトによる hold（governor は clean）"}
+
+   {:tid "t9" :phase 3 :actor :default
+    :request {:op :log-care-note :resident-id "resident-99"
+              :patch {:meal "breakfast" :mood "unknown"}}
+    :expect :hold
+    :intent "入居者名簿に存在しない ID — HARD hold（override 不可）"}
+
+   {:tid "t10" :phase 3 :actor :default
+    :request {:op :log-care-note :resident-id "resident-3"
+              :patch {:meal "breakfast" :mood "calm"}}
+    :expect :hold
+    :intent "登録済みだが未検証の入居者 — HARD hold（override 不可）"}
+
+   {:tid "t11" :phase 3 :actor :direct
+    :request {:op :schedule-family-visit :resident-id "resident-1"
+              :patch {:visitor-name "son" :date "2026-07-22"}}
+    :expect :hold
+    :intent "advisor が :effect :commit で直接実行を主張 — HARD hold（override 不可）"}
+
+   {:tid "t12" :phase 3 :actor :default
+    :request {:op :log-care-note :resident-id "resident-1"
+              :out-of-scope? true :patch {}}
+    :expect :hold
+    :intent "advisor が投薬・ケアプラン領域へ逸脱 — HARD hold（永久・override 不可）"}
+
+   {:tid "t13" :phase 3 :actor :unauthorized-op
+    :request {:op :administer-medication :resident-id "resident-1"
+              :patch {:meal "breakfast" :mood "calm"}}
+    :expect :hold
+    :intent "closed allowlist の外の op を advisor が提案 — HARD hold（override 不可）"}])
+
+(defn- direct-actuation-advisor
+  "An advisor that claims direct actuation instead of a proposal --
+  verbatim from `eldercareops.sim`'s own `:effect :commit` probe."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req] (assoc (advisor/infer nil req) :effect :commit))))
+
+(defn- unauthorized-op-advisor
+  "An advisor that proposes an op it was never authorized to propose --
+  the failure mode `eldercareops.governor`'s docstring names alongside
+  scope drift and folds into the same HARD check.
+
+  Nothing here is invented prose. It asks the repo's OWN advisor for a
+  well-formed `:log-care-note` proposal against the same seeded resident
+  and relabels ONLY `:op`, so exactly one variable differs from the
+  clean run at `t2`. `:effect` stays `:propose` and the resident stays
+  verified, which isolates `:op-not-allowed` from the other two HARD
+  checks instead of tripping several at once.
+
+  Note the short-circuit this exposes: the request op
+  `:administer-medication` also puts `medic` into the text blob that
+  `scope-exclusion-violations` scans, but that function is a `cond` whose
+  allowlist branch is tested first, so the reported rule is
+  `:op-not-allowed` and never `:scope-excluded`."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req]
+      (assoc (advisor/infer nil (assoc req :op :log-care-note))
+             :op (:op req)))))
+
+(defn run-scenario!
+  "Drives every step above through the real compiled StateGraph against
+  one freshly seeded store. Returns {:db .. :runs [{:step .. :state ..}]}
+  where each `:state` is the actor's own final channel map."
+  []
+  (let [db (store/seed-db)
+        actors {:default (op/build db)
+                :direct  (op/build db {:advisor (direct-actuation-advisor)})
+                :unauthorized-op (op/build db {:advisor (unauthorized-op-advisor)})}
+        runs (doall
+              (for [{:keys [tid phase actor request approve reject] :as step} scenario]
+                (let [a (get actors actor)
+                      r (g/run* a {:request request :context (ctx phase)}
+                                {:thread-id tid})
+                      r (cond
+                          approve (g/run* a {:approval {:status :approved :by approve}}
+                                          {:thread-id tid :resume? true})
+                          reject  (g/run* a {:approval {:status :rejected :by reject}}
+                                          {:thread-id tid :resume? true})
+                          :else r)]
+                  {:step step :state (:state r)})))]
+    {:db db :runs (vec runs)}))
+
+;; ----------------------------- html helpers -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- kw-name [k] (if (keyword? k) (name k) (str k)))
+
+(defn- fmt-map
+  "Renders a payload map with keys sorted, so no run depends on map
+  iteration order."
+  [m]
+  (if (seq m)
+    (->> (sort-by (comp str key) m)
+         (map (fn [[k v]] (str (kw-name k) "=" (if (string? v) v (pr-str v)))))
+         (str/join ", "))
+    "—"))
+
+(defn- sorted-op-names [ops] (sort (map name ops)))
+
+(defn- row [cells] (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+
+(defn- rows [xs] (str/join "\n" xs))
+
+(defn- tag [class text] (str "<span class=\"" class "\">" text "</span>"))
+
+;; ----------------------------- fact classification -----------------------------
+
+(defn- hard-hold?
+  "A HARD governor hold: a `:governor-hold` fact carrying at least one
+  un-overridable rule violation. A phase-gated hold writes the same
+  fact type with NO violations, so violations -- not the fact type --
+  are what make a hold un-overridable."
+  [f]
+  (and (= :governor-hold (:t f)) (seq (:violations f))))
+
+(defn- phase-hold? [f]
+  (and (= :governor-hold (:t f)) (empty? (:violations f))))
+
+(defn- hard-holds [ledger] (filterv hard-hold? ledger))
+
+(defn- actual-disposition
+  "Classifies a finished run in the scenario's own `:expect` vocabulary
+  (`:commit` | `:hold`), reading the run's OWN final audit fact rather
+  than any declaration. Deliberately the same tail-of-`:audit` reading
+  the run table's outcome cell uses, so the drift finding below can
+  never disagree with the table above it."
+  [{:keys [state]}]
+  (if (= :committed (:t (last (:audit state)))) :commit :hold))
+
+(defn- outcome-reason
+  "Plain-text (un-escaped) reason for a run's final disposition."
+  [{:keys [state]}]
+  (let [f (last (:audit state))]
+    (cond
+      (hard-hold? f) (str "HARD hold · " (str/join ", " (map (comp name :rule) (:violations f))))
+      (phase-hold? f) (str "phase hold · " (kw-name (:phase-reason f)))
+      (= :approval-rejected (:t f)) "人間が却下"
+      (= :committed (:t f)) (if (some #(= :approval-granted (:t %)) (:audit state))
+                              "承認のうえ commit" "auto-commit")
+      :else (kw-name (:disposition state)))))
+
+(defn- exercised-rules
+  "The distinct HARD rules this run actually drove the governor to emit,
+  read back out of the ledger rather than declared."
+  [ledger]
+  (into (sorted-set) (for [f (hard-holds ledger), v (:violations f)] (:rule v))))
+
+(defn- outcome-cell [{:keys [state]}]
+  (let [audit (:audit state)
+        last-fact (last audit)]
+    (cond
+      (hard-hold? last-fact)
+      (tag "critical" (str "HARD hold · "
+                           (esc (str/join ", " (map (comp name :rule) (:violations last-fact))))))
+
+      (phase-hold? last-fact)
+      (tag "warn" (str "phase hold · " (esc (kw-name (:phase-reason last-fact)))))
+
+      (= :approval-rejected (:t last-fact))
+      (tag "warn" "人間が却下 · hold")
+
+      (= :committed (:t last-fact))
+      (if (some #(= :approval-granted (:t %)) audit)
+        (tag "ok" "承認のうえ commit")
+        (tag "ok" "auto-commit"))
+
+      (= :approval-requested (:t last-fact))
+      (tag "warn" "承認待ち")
+
+      :else (tag "muted" (esc (kw-name (:disposition state)))))))
+
+;; ----------------------------- derived findings -----------------------------
+
+(defn- scope-hits
+  "Re-derives the governor's own scope-exclusion scan over a proposal,
+  reproducing `governor`'s private `text-blob` (the same select-keys and
+  lower-casing), and reports which of `governor/scope-excluded-terms`
+  matched and in which advisor-authored field."
+  [proposal]
+  (let [fields [:op :summary :rationale :cites :value]
+        blob (str/lower-case (pr-str (select-keys proposal fields)))]
+    (for [term governor/scope-excluded-terms
+          :when (str/includes? blob term)]
+      {:term term
+       :fields (vec (for [f fields
+                          :when (str/includes? (str/lower-case (pr-str (get proposal f))) term)]
+                      f))})))
+
+(defn- finding-self-tripping-ops
+  "MEASURED, not asserted: for every op on the closed allowlist, ask the
+  repo's own advisor for its proposal using this scenario's own request,
+  then run the governor's own scope vocabulary over it. Any op that
+  trips the scan on its OWN boilerplate is structurally un-committable.
+  Returns [] when nothing trips -- so this finding self-corrects."
+  []
+  (let [req-for (into {} (for [{:keys [request]} scenario
+                               :when (and (contains? governor/allowed-ops (:op request))
+                                          (not (:out-of-scope? request)))]
+                           [(:op request) request]))]
+    (vec
+     (for [op (sort-by name governor/allowed-ops)
+           :let [request (get req-for op)
+                 proposal (when request (advisor/infer nil request))
+                 hits (when proposal (seq (scope-hits proposal)))]
+           :when hits]
+       {:op op :proposal proposal :hits (vec hits)}))))
+
+(defn- finding-intent-drift
+  "MEASURED: every scenario step declares `:expect` -- what the step was
+  written to demonstrate. This compares that declaration against what the
+  actor ACTUALLY did on this run and returns the mismatches.
+
+  This function is the reason `:expect` exists. Until Wave 15 the scenario
+  carried `:expect` on all 13 steps, a comment promised they were
+  `compared against the actor's ACTUAL disposition`, and nothing read
+  them -- a check that is documented but never runs returns the same
+  silence as a check that ran and found nothing. It was hiding a real
+  mismatch (`t4`).
+
+  Drift is DISCLOSED, not thrown on, and the declaration is not quietly
+  rewritten to match reality: a step whose demonstration was defeated by
+  a genuine defect is exactly the thing a reader needs to see. Fix the
+  underlying behaviour and the row disappears on the next regeneration."
+  [runs]
+  (vec
+   (for [{:keys [step] :as r} runs
+         :let [expected (:expect step)
+               actual (actual-disposition r)]
+         :when (and expected (not= expected actual))]
+     {:tid (:tid step)
+      :op (get-in step [:request :op])
+      :expected expected
+      :actual actual
+      :reason (outcome-reason r)
+      :intent (:intent step)})))
+
+(defn- approver-audit
+  "MEASURED: for each committed run, compare the record the actor handed
+  to the store against the record the store actually kept, so a DROPPED
+  approver is distinguishable from a legitimate auto-commit with no
+  approver at all. Pairs runs to stored records by commit order (the
+  store appends with `conj` on a vector, so order is the pairing)."
+  [runs stored]
+  (let [committed (filterv #(= :commit (:disposition (:state %))) runs)]
+    (vec
+     (map-indexed
+      (fn [i {:keys [step state]}]
+        (let [runtime (:record state)
+              kept (get stored i)
+              granted (first (filter #(= :approval-granted (:t %)) (:audit state)))
+              approver (:by granted)
+              in-payload (get-in kept [:payload :approved-by])
+              in-value (get-in kept [:value :approved-by])
+              runtime-approver (or (get-in runtime [:payload :approved-by])
+                                   (get-in runtime [:value :approved-by]))]
+          {:tid (:tid step)
+           :op (get-in step [:request :op])
+           :resident-id (get-in step [:request :resident-id])
+           :kept kept
+           :approver approver
+           :runtime-approver runtime-approver
+           :retained (cond
+                       (nil? approver) :no-approver
+                       (or in-payload in-value) :retained
+                       :else :dropped)
+           :fields (vec (concat (when in-payload [:payload]) (when in-value [:value])))}))
+      committed))))
+
+;; ----------------------------- page -----------------------------
+
+(def ^:private css
+  (str/join
+   "\n"
+   ["  :root{--ink:#1a1a1c;--muted:#5c5c66;--line:#d8d8de;--blue:#0017c1;--bg:#f5f6f8}"
+    "  *{box-sizing:border-box}"
+    "  body{margin:0;background:var(--bg);color:var(--ink);line-height:1.65;"
+    "font-family:system-ui,-apple-system,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif}"
+    "  header.bar{background:var(--blue);color:#fff;padding:22px 28px}"
+    "  header.bar h1{margin:0 0 6px;font-size:1.3rem;line-height:1.4}"
+    "  .badge{display:inline-block;background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.4);"
+    "border-radius:4px;padding:2px 10px;font-size:.8rem}"
+    "  main{max-width:1180px;margin:0 auto;padding:24px 20px 64px}"
+    "  section.card{background:#fff;border:1px solid var(--line);border-radius:8px;padding:20px 22px;margin:0 0 20px}"
+    "  section.card h2{margin:0 0 4px;font-size:1.05rem}"
+    "  p.muted,.muted{color:var(--muted)}"
+    "  p.muted{margin:0 0 14px;font-size:.88rem}"
+    "  table{width:100%;border-collapse:collapse;font-size:.86rem}"
+    "  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}"
+    "  th{background:#eef0f4;font-weight:600;white-space:nowrap}"
+    "  code{background:#eef0f4;border-radius:3px;padding:1px 5px;font-size:.85em}"
+    "  .ok{color:#16610a;font-weight:600}"
+    "  .warn{color:#8a5300;font-weight:600}"
+    "  .critical{color:#b4000f;font-weight:600}"
+    "  .finding{border-left:4px solid #b4000f;background:#fff5f5;padding:12px 16px;margin:12px 0;border-radius:0 6px 6px 0}"
+    "  .finding.clear{border-left-color:#16610a;background:#f2f9f0}"
+    "  .finding h3{margin:0 0 6px;font-size:.95rem}"
+    "  .finding p{margin:4px 0;font-size:.86rem}"
+    "  footer{max-width:1180px;margin:0 auto;padding:0 20px 40px;font-size:.8rem;color:var(--muted)}"]))
+
+(defn- resident-rows [db]
+  (rows
+   (for [{:keys [resident-id name registered? verified?]} (store/all-residents db)]
+     (row [(str "<code>" (esc resident-id) "</code>")
+           (esc name)
+           (if registered? (tag "ok" "registered") (tag "critical" "unregistered"))
+           (if verified? (tag "ok" "verified") (tag "critical" "unverified"))
+           (if (and registered? verified?)
+             (tag "muted" "提案の対象にできる")
+             (tag "critical" "いかなる提案も HARD hold"))]))))
+
+(defn- run-rows [runs]
+  (rows
+   (for [{:keys [step] :as r} runs
+         :let [{:keys [tid phase request]} step]]
+     (row [(str "<code>" (esc tid) "</code>")
+           (str "phase " phase)
+           (str "<code>" (esc (name (:op request))) "</code>")
+           (str "<code>" (esc (:resident-id request)) "</code>")
+           (esc (fmt-map (:patch request)))
+           (outcome-cell r)]))))
+
+(defn- gate-rows []
+  (rows
+   (for [op (sort-by name governor/allowed-ops)
+         :let [auto3? (contains? (get-in phase/phases [3 :auto]) op)
+               always? (contains? governor/always-escalate-ops op)]]
+     (row [(str "<code>" (esc (name op)) "</code>")
+           (if always?
+             (tag "warn" "常に人間の承認 · どの phase でも自動化されない")
+             (if auto3?
+               (tag "ok" "phase 3: governor clean かつ高信頼なら auto-commit")
+               (tag "warn" "phase 3 でも承認必須")))
+           (esc (str/join ", " (sort (for [[p {:keys [writes]}] phase/phases
+                                           :when (contains? writes op)]
+                                       (str "phase " p)))))]))))
+
+(defn- phase-rows []
+  (rows
+   (for [[p {:keys [label writes auto]}] (sort-by key phase/phases)]
+     (row [(str "phase " p)
+           (esc label)
+           (if (seq writes) (esc (str/join ", " (sorted-op-names writes))) (tag "muted" "—"))
+           (if (seq auto) (esc (str/join ", " (sorted-op-names auto))) (tag "muted" "—"))]))))
+
+(defn- hold-rows [ledger]
+  (rows
+   (for [f (hard-holds ledger)
+         v (:violations f)]
+     (row [(str "<code>" (esc (name (:op f))) "</code>")
+           (str "<code>" (esc (:resident-id f)) "</code>")
+           (tag "critical" (esc (name (:rule v))))
+           (esc (:detail v))]))))
+
+(defn- ssot-rows [audit]
+  (rows
+   (for [{:keys [tid op resident-id kept approver retained fields]} audit]
+     (row [(str "<code>" (esc tid) "</code>")
+           (str "<code>" (esc (name op)) "</code>")
+           (str "<code>" (esc resident-id) "</code>")
+           (esc (fmt-map (dissoc (:payload kept) :resident-id)))
+           (case retained
+             :no-approver (tag "muted" "auto-commit · 承認者なし")
+             :retained (tag "ok" (str (esc approver) " · "
+                                      (str/join ", " (map #(str "<code>:" (name %) "</code>") fields))
+                                      " に保持"))
+             :dropped (tag "critical" (str "承認者 " (esc approver)
+                                           " が store に残っていない")))]))))
+
+(defn- ledger-rows [ledger]
+  (rows
+   (for [f ledger]
+     (row [(esc (name (:t f)))
+           (str "<code>" (esc (name (or (:op f) :n-a))) "</code>")
+           (str "<code>" (esc (:resident-id f)) "</code>")
+           (cond
+             (seq (:basis f)) (esc (str/join ", " (map #(if (keyword? %) (name %) (str %)) (:basis f))))
+             (:phase-reason f) (esc (name (:phase-reason f)))
+             (:by f) (esc (str "by " (:by f)))
+             :else (tag "muted" "—"))
+           (if-let [c (:confidence f)] (esc c) (tag "muted" "—"))]))))
+
+(defn- drift-html [drift]
+  (if (seq drift)
+    (str "    <div class=\"finding\">\n"
+         "      <h3>所見 · 宣言した想定と実際の挙動がずれている（" (count drift) " 件）</h3>\n"
+         "      <p>各 step は「何を実演するか」を <code>:expect</code> として宣言している。"
+         "この実行では次の step が宣言どおりに動いていない。</p>\n"
+         "      <table>\n"
+         "        <thead><tr><th>thread</th><th>op</th><th>宣言</th><th>実際</th><th>この step の意図</th></tr></thead>\n"
+         "        <tbody>\n"
+         (rows (for [{:keys [tid op expected actual reason intent]} drift]
+                 (row [(str "<code>" (esc tid) "</code>")
+                       (str "<code>" (esc (name op)) "</code>")
+                       (tag "muted" (esc (kw-name expected)))
+                       (tag "critical" (str (esc (kw-name actual)) " · " (esc reason)))
+                       (esc intent)])))
+         "\n        </tbody>\n"
+         "      </table>\n"
+         "    </div>\n")
+    (str "    <div class=\"finding clear\">\n"
+         "      <h3>所見 · 全 step が宣言どおりの disposition を返している</h3>\n"
+         "      <p>各 step の <code>:expect</code> と実際の disposition を突き合わせた結果、"
+         "ずれは 0 件。</p>\n"
+         "    </div>\n")))
+
+(defn- findings-html [drift self-tripping approver-rows]
+  (let [drop-rows (filterv #(= :dropped (:retained %)) approver-rows)
+        value-carried (filterv #(and (= :retained (:retained %))
+                                     (not (some #{:value} (:fields %))))
+                               approver-rows)]
+    (str
+     ;; Finding 0 -- declared intent vs. what the actor actually did.
+     (drift-html drift)
+     "\n"
+     ;; Finding 1 -- derived from the governor's own vocabulary.
+     (if (seq self-tripping)
+       (str/join
+        "\n"
+        (for [{:keys [op hits proposal]} self-tripping]
+          (str "    <div class=\"finding\">\n"
+               "      <h3>所見 · <code>" (esc (name op))
+               "</code> は自分自身の但し書きで恒久的に HARD hold される</h3>\n"
+               "      <p>この op は closed allowlist の一員だが、advisor が生成する定型文が "
+               "governor の scope 除外語彙に一致するため、内容にかかわらず commit できない。"
+               "一致した語: "
+               (str/join "、" (for [{:keys [term fields]} hits]
+                                (str "<code>" (esc term) "</code>（"
+                                     (str/join ", " (map #(str ":" (name %)) fields)) " 内）")))
+               "</p>\n"
+               "      <p class=\"muted\">該当箇所: 「" (esc (:rationale proposal)) "」 — "
+               "これは投薬が<em>ない</em>ことを述べた否定文だが、部分文字列走査は肯定的な言及と区別できない。"
+               "走査が否定を扱えるようになるか語彙が変われば、この所見は次回生成時に自動的に消える。</p>\n"
+               "    </div>")))
+       (str "    <div class=\"finding clear\">\n"
+            "      <h3>所見 · allowlist の全 op が自分自身の定型文で scope 走査を通過する</h3>\n"
+            "      <p>各 op について advisor の提案を生成し governor の語彙で走査した結果、"
+            "自己一致は 0 件。</p>\n"
+            "    </div>\n"))
+     "\n"
+     ;; Finding 2 -- measured store retention.
+     (cond
+       (seq drop-rows)
+       (str "    <div class=\"finding\">\n"
+            "      <h3>所見 · 承認者が SSoT に残っていない</h3>\n"
+            "      <p>実行時には " (esc (:runtime-approver (first drop-rows)))
+            " が承認したが、store に残った record には承認者属性が無い（"
+            (esc (str/join ", " (map :tid drop-rows))) "）。監査上、承認された commit と"
+            "自動 commit が区別できない。</p>\n"
+            "    </div>\n")
+
+       (seq value-carried)
+       (str "    <div class=\"finding\">\n"
+            "      <h3>所見 · 承認者は <code>:payload</code> にしか残らない</h3>\n"
+            "      <p>store は record 全体を保持するので承認者は失われていない（"
+            (esc (str/join ", " (map :tid value-carried)))
+            "）。ただし承認者が入るのは <code>:payload</code> だけで、"
+            "<code>:value</code> は承認前の草案のままである。<code>:value</code> だけを読む下流の"
+            "利用者は、承認された record を承認者なしと読む。</p>\n"
+            "    </div>\n")
+
+       :else
+       (str "    <div class=\"finding clear\">\n"
+            "      <h3>所見 · 承認者は commit された record に保持されている</h3>\n"
+            "      <p>承認を経た commit すべてで、承認者属性が store の record に残っている。</p>\n"
+            "    </div>\n")))))
+
+(defn render
+  "Renders the whole document from an already-executed scenario."
+  [{:keys [db runs]}]
+  (let [ledger (vec (store/ledger db))
+        stored (vec (store/coordination-log db))
+        approver-rows (approver-audit runs stored)
+        drift (finding-intent-drift runs)
+        self-tripping (finding-self-tripping-ops)
+        n-hard (count (hard-holds ledger))
+        rules (exercised-rules ledger)]
+    (str
+     "<!doctype html>\n<html lang=\"ja\"><head><meta charset=\"utf-8\">\n"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+     "<title>cloud-itonami-isic-873 · eldercareops operator console</title>\n"
+     "<style>\n" css "\n</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>高齢者・障害者向け居住型ケア（ISIC 873） — オペレーターコンソール</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · 調整業務のみ（投薬・臨床判断・ケアプラン変更・身体拘束・終末期判断は永久に対象外）</span>\n"
+     "</header>\n"
+     "<main>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>入居者名簿（SSoT）</h2>\n"
+     "    <p class=\"muted\">"
+     "<code>eldercareops.store/all-residents</code> の実データ。登録済みかつ検証済みでない入居者は、"
+     "いかなる提案も governor が HARD hold する。</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>入居者 ID</th><th>氏名</th><th>登録</th><th>検証</th><th>提案の可否</th></tr></thead>\n"
+     "      <tbody>\n" (resident-rows db) "\n      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>この実行の全 run（" (count runs) " 件）</h2>\n"
+     "    <p class=\"muted\">"
+     "1 run = 1 リクエスト = 1 回の StateGraph 実行（intake → advise → govern → decide → commit｜hold｜承認）。"
+     "結果は各 run の <code>:audit</code> チャンネルから導出しており、記述ではない。</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>thread</th><th>phase</th><th>op</th><th>入居者</th><th>リクエスト内容</th><th>結果</th></tr></thead>\n"
+     "      <tbody>\n" (run-rows runs) "\n      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>HARD hold 一覧（" n-hard " 件 · override 不可）</h2>\n"
+     "    <p class=\"muted\">"
+     "governor の 3 つの HARD チェックによる拒否。人間の承認でも覆せず、承認画面にすら到達しない。"
+     "段階ロールアウトによる hold は違反を伴わないため、ここには現れない。<br>"
+     "この実行が実際に発火させた規則: "
+     (str/join "、" (for [r rules] (str "<code>" (esc (name r)) "</code>")))
+     "（" (count rules) "/" (count governor-hard-rules) "）。"
+     "件数ではなく<em>網羅</em>が生成条件で、未発火の規則が 1 つでもあれば "
+     "<code>-main</code> は書き込みを拒否して失敗する。</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>op</th><th>入居者</th><th>規則</th><th>理由</th></tr></thead>\n"
+     "      <tbody>\n" (hold-rows ledger) "\n      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>アクションゲート</h2>\n"
+     "    <p class=\"muted\">"
+     "<code>governor/allowed-ops</code>・<code>governor/always-escalate-ops</code>・"
+     "<code>phase/phases</code> から導出。<code>flag-safety-concern</code> が"
+     "どの phase の <code>:auto</code> にも属さないことは、governor と phase の 2 層が独立に保証する。</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>op</th><th>ゲート</th><th>書き込みが有効な phase</th></tr></thead>\n"
+     "      <tbody>\n" (gate-rows) "\n      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>段階ロールアウト</h2>\n"
+     "    <p class=\"muted\"><code>eldercareops.phase/phases</code> をそのまま表にしたもの。</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>phase</th><th>ラベル</th><th>書き込み可</th><th>自動 commit 可</th></tr></thead>\n"
+     "      <tbody>\n" (phase-rows) "\n      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>commit された調整記録（" (count stored) " 件）</h2>\n"
+     "    <p class=\"muted\">"
+     "<code>store/coordination-log</code> の実データ。承認者の列は、actor が store に渡した record と"
+     "store が実際に保持した record を突き合わせて導出している（承認なしの auto-commit と、"
+     "承認者が失われた commit を区別するため）。</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>thread</th><th>op</th><th>入居者</th><th>保持された内容</th><th>承認者</th></tr></thead>\n"
+     "      <tbody>\n" (ssot-rows approver-rows) "\n      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>監査台帳（" (count ledger) " 件 · append-only）</h2>\n"
+     "    <p class=\"muted\"><code>store/ledger</code> の全件。提案・hold・commit・承認・却下の不変ログ。</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>事実</th><th>op</th><th>入居者</th><th>根拠</th><th>信頼度</th></tr></thead>\n"
+     "      <tbody>\n" (ledger-rows ledger) "\n      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>この実行から導出した所見</h2>\n"
+     "    <p class=\"muted\">"
+     "以下は固定文ではなく、この実行の actor の語彙と store の中身から毎回導出している。"
+     "原因が直れば次回生成時に自動的に消える。</p>\n"
+     (findings-html drift self-tripping approver-rows)
+     "  </section>\n"
+     "</main>\n"
+     "<footer>\n"
+     "  <p>生成: <code>clojure -M:dev:render-html</code>（<code>eldercareops.render-html</code>）。"
+     "入居者 ID・氏名は <code>eldercareops.store/demo-data</code>、リクエスト内容は "
+     "<code>eldercareops.sim</code> から取得。タイムスタンプ・乱数を含まず、再実行しても byte 同一。</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db runs] :as result} (run-scenario!)
+        ledger (vec (store/ledger db))
+        n-hard (count (hard-holds ledger))
+        rules (exercised-rules ledger)
+        missing (set/difference governor-hard-rules rules)
+        html (render result)]
+    (when (zero? n-hard)
+      (throw (ex-info (str "refusing to write " out
+                           ": the scenario produced no HARD governor hold. "
+                           "A console for a governed actor that never shows the governor "
+                           "saying no is a brochure, not evidence.")
+                      {:out out :ledger-facts (count ledger) :hard-holds 0})))
+    ;; Coverage, not just count: holds that all fire one rule prove one
+    ;; check works and say nothing about the rest. Fails closed.
+    (when (seq missing)
+      (throw (ex-info (str "refusing to write " out
+                           ": the scenario never drove the governor to emit "
+                           (str/join ", " (map name (sort missing)))
+                           ". Every HARD rule must be demonstrated, not just counted.")
+                      {:out out :exercised (vec rules) :missing (vec (sort missing))})))
+    (io/make-parents out)
+    (spit out html)
+    (println "wrote" out
+             (str "(" (count runs) " runs, " (count ledger) " ledger facts, "
+                  n-hard " HARD holds covering " (count rules) "/"
+                  (count governor-hard-rules) " governor rules ["
+                  (str/join " " (map name rules)) "], "
+                  (count (store/coordination-log db)) " committed records)"))))

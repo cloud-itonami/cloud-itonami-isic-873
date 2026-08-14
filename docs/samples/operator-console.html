@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloud-itonami-isic-873 · eldercareops operator console</title>
+<style>
+  :root{--ink:#1a1a1c;--muted:#5c5c66;--line:#d8d8de;--blue:#0017c1;--bg:#f5f6f8}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);line-height:1.65;
+font-family:system-ui,-apple-system,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif}
+  header.bar{background:var(--blue);color:#fff;padding:22px 28px}
+  header.bar h1{margin:0 0 6px;font-size:1.3rem;line-height:1.4}
+  .badge{display:inline-block;background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.4);
+border-radius:4px;padding:2px 10px;font-size:.8rem}
+  main{max-width:1180px;margin:0 auto;padding:24px 20px 64px}
+  section.card{background:#fff;border:1px solid var(--line);border-radius:8px;padding:20px 22px;margin:0 0 20px}
+  section.card h2{margin:0 0 4px;font-size:1.05rem}
+  p.muted,.muted{color:var(--muted)}
+  p.muted{margin:0 0 14px;font-size:.88rem}
+  table{width:100%;border-collapse:collapse;font-size:.86rem}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#eef0f4;font-weight:600;white-space:nowrap}
+  code{background:#eef0f4;border-radius:3px;padding:1px 5px;font-size:.85em}
+  .ok{color:#16610a;font-weight:600}
+  .warn{color:#8a5300;font-weight:600}
+  .critical{color:#b4000f;font-weight:600}
+  .finding{border-left:4px solid #b4000f;background:#fff5f5;padding:12px 16px;margin:12px 0;border-radius:0 6px 6px 0}
+  .finding.clear{border-left-color:#16610a;background:#f2f9f0}
+  .finding h3{margin:0 0 6px;font-size:.95rem}
+  .finding p{margin:4px 0;font-size:.86rem}
+  footer{max-width:1180px;margin:0 auto;padding:0 20px 40px;font-size:.8rem;color:var(--muted)}
+</style></head><body>
+<header class="bar">
+  <h1>高齢者・障害者向け居住型ケア（ISIC 873） — オペレーターコンソール</h1>
+  <span class="badge">read-only sample · governor-gated · 調整業務のみ（投薬・臨床判断・ケアプラン変更・身体拘束・終末期判断は永久に対象外）</span>
+</header>
+<main>
+  <section class="card">
+    <h2>入居者名簿（SSoT）</h2>
+    <p class="muted"><code>eldercareops.store/all-residents</code> の実データ。登録済みかつ検証済みでない入居者は、いかなる提案も governor が HARD hold する。</p>
+    <table>
+      <thead><tr><th>入居者 ID</th><th>氏名</th><th>登録</th><th>検証</th><th>提案の可否</th></tr></thead>
+      <tbody>
+        <tr><td><code>resident-1</code></td><td>Alice Chen (DOB 1935)</td><td><span class="ok">registered</span></td><td><span class="ok">verified</span></td><td><span class="muted">提案の対象にできる</span></td></tr>
+        <tr><td><code>resident-2</code></td><td>Bob Kowalski (DOB 1938)</td><td><span class="ok">registered</span></td><td><span class="ok">verified</span></td><td><span class="muted">提案の対象にできる</span></td></tr>
+        <tr><td><code>resident-3</code></td><td>Carol Martinez (DOB 1940, in intake)</td><td><span class="ok">registered</span></td><td><span class="critical">unverified</span></td><td><span class="critical">いかなる提案も HARD hold</span></td></tr>
+      </tbody>
+    </table>
+  </section>
+  <section class="card">
+    <h2>この実行の全 run（13 件）</h2>
+    <p class="muted">1 run = 1 リクエスト = 1 回の StateGraph 実行（intake → advise → govern → decide → commit｜hold｜承認）。結果は各 run の <code>:audit</code> チャンネルから導出しており、記述ではない。</p>
+    <table>
+      <thead><tr><th>thread</th><th>phase</th><th>op</th><th>入居者</th><th>リクエスト内容</th><th>結果</th></tr></thead>
+      <tbody>
+        <tr><td><code>t1</code></td><td>phase 1</td><td><code>log-care-note</code></td><td><code>resident-1</code></td><td>activity=art class, meal=lunch eaten, mood=cheerful</td><td><span class="ok">承認のうえ commit</span></td></tr>
+        <tr><td><code>t2</code></td><td>phase 3</td><td><code>log-care-note</code></td><td><code>resident-1</code></td><td>activity=card game, meal=dinner eaten, mood=calm</td><td><span class="ok">auto-commit</span></td></tr>
+        <tr><td><code>t3</code></td><td>phase 3</td><td><code>schedule-family-visit</code></td><td><code>resident-1</code></td><td>date=2026-07-20, time=14:00, visitor-name=daughter Sarah</td><td><span class="ok">auto-commit</span></td></tr>
+        <tr><td><code>t4</code></td><td>phase 3</td><td><code>coordinate-supply-request</code></td><td><code>resident-1</code></td><td>item=bed linens, quantity=2, urgency=routine</td><td><span class="critical">HARD hold · scope-excluded</span></td></tr>
+        <tr><td><code>t5</code></td><td>phase 3</td><td><code>schedule-staff-shift-proposal</code></td><td><code>resident-1</code></td><td>caregiver=nurse tech Chen, date=2026-07-21, shift=morning</td><td><span class="ok">auto-commit</span></td></tr>
+        <tr><td><code>t6</code></td><td>phase 3</td><td><code>flag-safety-concern</code></td><td><code>resident-1</code></td><td>concern=resident reported loss of balance near bathroom, confidence=0.92</td><td><span class="ok">承認のうえ commit</span></td></tr>
+        <tr><td><code>t7</code></td><td>phase 3</td><td><code>flag-safety-concern</code></td><td><code>resident-1</code></td><td>concern=resident reported loss of balance near bathroom, confidence=0.92</td><td><span class="warn">人間が却下 · hold</span></td></tr>
+        <tr><td><code>t8</code></td><td>phase 1</td><td><code>schedule-family-visit</code></td><td><code>resident-1</code></td><td>date=2026-07-20, time=14:00, visitor-name=daughter Sarah</td><td><span class="warn">phase hold · phase-disabled</span></td></tr>
+        <tr><td><code>t9</code></td><td>phase 3</td><td><code>log-care-note</code></td><td><code>resident-99</code></td><td>meal=breakfast, mood=unknown</td><td><span class="critical">HARD hold · resident-unverified</span></td></tr>
+        <tr><td><code>t10</code></td><td>phase 3</td><td><code>log-care-note</code></td><td><code>resident-3</code></td><td>meal=breakfast, mood=calm</td><td><span class="critical">HARD hold · resident-unverified</span></td></tr>
+        <tr><td><code>t11</code></td><td>phase 3</td><td><code>schedule-family-visit</code></td><td><code>resident-1</code></td><td>date=2026-07-22, visitor-name=son</td><td><span class="critical">HARD hold · effect-not-propose</span></td></tr>
+        <tr><td><code>t12</code></td><td>phase 3</td><td><code>log-care-note</code></td><td><code>resident-1</code></td><td>—</td><td><span class="critical">HARD hold · scope-excluded</span></td></tr>
+        <tr><td><code>t13</code></td><td>phase 3</td><td><code>administer-medication</code></td><td><code>resident-1</code></td><td>meal=breakfast, mood=calm</td><td><span class="critical">HARD hold · op-not-allowed</span></td></tr>
+      </tbody>
+    </table>
+  </section>
+  <section class="card">
+    <h2>HARD hold 一覧（6 件 · override 不可）</h2>
+    <p class="muted">governor の 3 つの HARD チェックによる拒否。人間の承認でも覆せず、承認画面にすら到達しない。段階ロールアウトによる hold は違反を伴わないため、ここには現れない。<br>この実行が実際に発火させた規則: <code>effect-not-propose</code>、<code>op-not-allowed</code>、<code>resident-unverified</code>、<code>scope-excluded</code>（4/4）。件数ではなく<em>網羅</em>が生成条件で、未発火の規則が 1 つでもあれば <code>-main</code> は書き込みを拒否して失敗する。</p>
+    <table>
+      <thead><tr><th>op</th><th>入居者</th><th>規則</th><th>理由</th></tr></thead>
+      <tbody>
+        <tr><td><code>coordinate-supply-request</code></td><td><code>resident-1</code></td><td><span class="critical">scope-excluded</span></td><td>投薬/臨床判断/ケアプラン変更/身体拘束/終末期判断/安全当局の判断領域に触れる提案は永久に禁止</td></tr>
+        <tr><td><code>log-care-note</code></td><td><code>resident-99</code></td><td><span class="critical">resident-unverified</span></td><td>resident-99 は未登録または未検証の入居者 -- いかなる提案も進められない</td></tr>
+        <tr><td><code>log-care-note</code></td><td><code>resident-3</code></td><td><span class="critical">resident-unverified</span></td><td>resident-3 は未登録または未検証の入居者 -- いかなる提案も進められない</td></tr>
+        <tr><td><code>schedule-family-visit</code></td><td><code>resident-1</code></td><td><span class="critical">effect-not-propose</span></td><td>:effect は :propose のみ許可されるが :commit が提案された</td></tr>
+        <tr><td><code>log-care-note</code></td><td><code>resident-1</code></td><td><span class="critical">scope-excluded</span></td><td>投薬/臨床判断/ケアプラン変更/身体拘束/終末期判断/安全当局の判断領域に触れる提案は永久に禁止</td></tr>
+        <tr><td><code>administer-medication</code></td><td><code>resident-1</code></td><td><span class="critical">op-not-allowed</span></td><td>:administer-medication は許可された操作(closed allowlist)に含まれない</td></tr>
+      </tbody>
+    </table>
+  </section>
+  <section class="card">
+    <h2>アクションゲート</h2>
+    <p class="muted"><code>governor/allowed-ops</code>・<code>governor/always-escalate-ops</code>・<code>phase/phases</code> から導出。<code>flag-safety-concern</code> がどの phase の <code>:auto</code> にも属さないことは、governor と phase の 2 層が独立に保証する。</p>
+    <table>
+      <thead><tr><th>op</th><th>ゲート</th><th>書き込みが有効な phase</th></tr></thead>
+      <tbody>
+        <tr><td><code>coordinate-supply-request</code></td><td><span class="ok">phase 3: governor clean かつ高信頼なら auto-commit</span></td><td>phase 2, phase 3</td></tr>
+        <tr><td><code>flag-safety-concern</code></td><td><span class="warn">常に人間の承認 · どの phase でも自動化されない</span></td><td>phase 3</td></tr>
+        <tr><td><code>log-care-note</code></td><td><span class="ok">phase 3: governor clean かつ高信頼なら auto-commit</span></td><td>phase 1, phase 2, phase 3</td></tr>
+        <tr><td><code>schedule-family-visit</code></td><td><span class="ok">phase 3: governor clean かつ高信頼なら auto-commit</span></td><td>phase 2, phase 3</td></tr>
+        <tr><td><code>schedule-staff-shift-proposal</code></td><td><span class="ok">phase 3: governor clean かつ高信頼なら auto-commit</span></td><td>phase 2, phase 3</td></tr>
+      </tbody>
+    </table>
+  </section>
+  <section class="card">
+    <h2>段階ロールアウト</h2>
+    <p class="muted"><code>eldercareops.phase/phases</code> をそのまま表にしたもの。</p>
+    <table>
+      <thead><tr><th>phase</th><th>ラベル</th><th>書き込み可</th><th>自動 commit 可</th></tr></thead>
+      <tbody>
+        <tr><td>phase 0</td><td>read-only</td><td><span class="muted">—</span></td><td><span class="muted">—</span></td></tr>
+        <tr><td>phase 1</td><td>assisted-logging</td><td>log-care-note</td><td><span class="muted">—</span></td></tr>
+        <tr><td>phase 2</td><td>assisted-coordination</td><td>coordinate-supply-request, log-care-note, schedule-family-visit, schedule-staff-shift-proposal</td><td><span class="muted">—</span></td></tr>
+        <tr><td>phase 3</td><td>supervised-auto</td><td>coordinate-supply-request, flag-safety-concern, log-care-note, schedule-family-visit, schedule-staff-shift-proposal</td><td>coordinate-supply-request, log-care-note, schedule-family-visit, schedule-staff-shift-proposal</td></tr>
+      </tbody>
+    </table>
+  </section>
+  <section class="card">
+    <h2>commit された調整記録（5 件）</h2>
+    <p class="muted"><code>store/coordination-log</code> の実データ。承認者の列は、actor が store に渡した record とstore が実際に保持した record を突き合わせて導出している（承認なしの auto-commit と、承認者が失われた commit を区別するため）。</p>
+    <table>
+      <thead><tr><th>thread</th><th>op</th><th>入居者</th><th>保持された内容</th><th>承認者</th></tr></thead>
+      <tbody>
+        <tr><td><code>t1</code></td><td><code>log-care-note</code></td><td><code>resident-1</code></td><td>activity=art class, approved-by=care-coordinator-1, meal=lunch eaten, mood=cheerful</td><td><span class="ok">care-coordinator-1 · <code>:payload</code> に保持</span></td></tr>
+        <tr><td><code>t2</code></td><td><code>log-care-note</code></td><td><code>resident-1</code></td><td>activity=card game, meal=dinner eaten, mood=calm</td><td><span class="muted">auto-commit · 承認者なし</span></td></tr>
+        <tr><td><code>t3</code></td><td><code>schedule-family-visit</code></td><td><code>resident-1</code></td><td>date=2026-07-20, time=14:00, visitor-name=daughter Sarah</td><td><span class="muted">auto-commit · 承認者なし</span></td></tr>
+        <tr><td><code>t5</code></td><td><code>schedule-staff-shift-proposal</code></td><td><code>resident-1</code></td><td>caregiver=nurse tech Chen, date=2026-07-21, shift=morning</td><td><span class="muted">auto-commit · 承認者なし</span></td></tr>
+        <tr><td><code>t6</code></td><td><code>flag-safety-concern</code></td><td><code>resident-1</code></td><td>approved-by=care-coordinator-1, concern=resident reported loss of balance near bathroom, confidence=0.92</td><td><span class="ok">care-coordinator-1 · <code>:payload</code> に保持</span></td></tr>
+      </tbody>
+    </table>
+  </section>
+  <section class="card">
+    <h2>監査台帳（13 件 · append-only）</h2>
+    <p class="muted"><code>store/ledger</code> の全件。提案・hold・commit・承認・却下の不変ログ。</p>
+    <table>
+      <thead><tr><th>事実</th><th>op</th><th>入居者</th><th>根拠</th><th>信頼度</th></tr></thead>
+      <tbody>
+        <tr><td>committed</td><td><code>log-care-note</code></td><td><code>resident-1</code></td><td>resident-1</td><td><span class="muted">—</span></td></tr>
+        <tr><td>committed</td><td><code>log-care-note</code></td><td><code>resident-1</code></td><td>resident-1</td><td><span class="muted">—</span></td></tr>
+        <tr><td>committed</td><td><code>schedule-family-visit</code></td><td><code>resident-1</code></td><td>resident-1</td><td><span class="muted">—</span></td></tr>
+        <tr><td>governor-hold</td><td><code>coordinate-supply-request</code></td><td><code>resident-1</code></td><td>scope-excluded</td><td>0.91</td></tr>
+        <tr><td>committed</td><td><code>schedule-staff-shift-proposal</code></td><td><code>resident-1</code></td><td>resident-1</td><td><span class="muted">—</span></td></tr>
+        <tr><td>committed</td><td><code>flag-safety-concern</code></td><td><code>resident-1</code></td><td>resident-1</td><td><span class="muted">—</span></td></tr>
+        <tr><td>approval-rejected</td><td><code>flag-safety-concern</code></td><td><code>resident-1</code></td><td>approver-rejected</td><td>0.92</td></tr>
+        <tr><td>governor-hold</td><td><code>schedule-family-visit</code></td><td><code>resident-1</code></td><td>phase-disabled</td><td>0.89</td></tr>
+        <tr><td>governor-hold</td><td><code>log-care-note</code></td><td><code>resident-99</code></td><td>resident-unverified</td><td>0.94</td></tr>
+        <tr><td>governor-hold</td><td><code>log-care-note</code></td><td><code>resident-3</code></td><td>resident-unverified</td><td>0.94</td></tr>
+        <tr><td>governor-hold</td><td><code>schedule-family-visit</code></td><td><code>resident-1</code></td><td>effect-not-propose</td><td>0.89</td></tr>
+        <tr><td>governor-hold</td><td><code>log-care-note</code></td><td><code>resident-1</code></td><td>scope-excluded</td><td>0.94</td></tr>
+        <tr><td>governor-hold</td><td><code>administer-medication</code></td><td><code>resident-1</code></td><td>op-not-allowed</td><td>0.94</td></tr>
+      </tbody>
+    </table>
+  </section>
+  <section class="card">
+    <h2>この実行から導出した所見</h2>
+    <p class="muted">以下は固定文ではなく、この実行の actor の語彙と store の中身から毎回導出している。原因が直れば次回生成時に自動的に消える。</p>
+    <div class="finding">
+      <h3>所見 · 宣言した想定と実際の挙動がずれている（1 件）</h3>
+      <p>各 step は「何を実演するか」を <code>:expect</code> として宣言している。この実行では次の step が宣言どおりに動いていない。</p>
+      <table>
+        <thead><tr><th>thread</th><th>op</th><th>宣言</th><th>実際</th><th>この step の意図</th></tr></thead>
+        <tbody>
+        <tr><td><code>t4</code></td><td><code>coordinate-supply-request</code></td><td><span class="muted">commit</span></td><td><span class="critical">hold · HARD hold · scope-excluded</span></td><td>非医薬品（寝具リネン）の調達調整 — allowlist 内の op、phase 3 の auto 対象</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="finding">
+      <h3>所見 · <code>coordinate-supply-request</code> は自分自身の但し書きで恒久的に HARD hold される</h3>
+      <p>この op は closed allowlist の一員だが、advisor が生成する定型文が governor の scope 除外語彙に一致するため、内容にかかわらず commit できない。一致した語: <code>薬</code>（:rationale 内）</p>
+      <p class="muted">該当箇所: 「布製品・移動補助具・食料品などの非医薬品消耗品の調達調整のみ。投薬なし。」 — これは投薬が<em>ない</em>ことを述べた否定文だが、部分文字列走査は肯定的な言及と区別できない。走査が否定を扱えるようになるか語彙が変われば、この所見は次回生成時に自動的に消える。</p>
+    </div>
+    <div class="finding">
+      <h3>所見 · 承認者は <code>:payload</code> にしか残らない</h3>
+      <p>store は record 全体を保持するので承認者は失われていない（t1, t6）。ただし承認者が入るのは <code>:payload</code> だけで、<code>:value</code> は承認前の草案のままである。<code>:value</code> だけを読む下流の利用者は、承認された record を承認者なしと読む。</p>
+    </div>
+  </section>
+</main>
+<footer>
+  <p>生成: <code>clojure -M:dev:render-html</code>（<code>eldercareops.render-html</code>）。入居者 ID・氏名は <code>eldercareops.store/demo-data</code>、リクエスト内容は <code>eldercareops.sim</code> から取得。タイムスタンプ・乱数を含まず、再実行しても byte 同一。</p>
+</footer>
+</body></html>
