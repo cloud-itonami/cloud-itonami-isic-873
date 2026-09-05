@@ -417,11 +417,32 @@
 (def ^:private css
   (str/join
    "\n"
-   ["  :root{--ink:#1a1a1c;--muted:#5c5c66;--line:#d8d8de;--blue:#0017c1;--bg:#f5f6f8}"
+   [;; DADS (デジタル庁デザインシステム) primitives, copied by value from
+    ;; this repo's OWN vendored product face `docs/index.html`, so the
+    ;; console reads as the same system and the build stays offline. No
+    ;; jp-go-dds git dep: this page is a build artifact and must render
+    ;; from the checkout alone.
+    "  :root{"
+    "--color-primitive-blue-900:#0017c1;"
+    "--color-primitive-red-900:#ce0000;--color-primitive-red-50:#fdeeee;"
+    "--color-primitive-green-800:#197a4b;--color-primitive-green-50:#e6f5ec;"
+    "--color-primitive-orange-1000:#8b3200;"
+    ;; semantic aliases -- what this console means, mapped onto the above.
+    ;; Tints deliberately use the -50 steps: DADS `semantic-error-1`/`-2`
+    ;; are red-800/red-900, both dark, so neither is a background.
+    "--key:var(--color-primitive-blue-900);"
+    "--ok:var(--color-primitive-green-800);"
+    "--warn:var(--color-primitive-orange-1000);"
+    "--critical:var(--color-primitive-red-900);"
+    "--tint-ok:var(--color-primitive-green-50);"
+    "--tint-error:var(--color-primitive-red-50);"
+    ;; neutrals: no grey family is vendored in docs/index.html, so these
+    ;; stay local and are not labelled as DADS tokens.
+    "--ink:#1a1a1c;--muted:#5c5c66;--line:#d8d8de;--bg:#f5f6f8}"
     "  *{box-sizing:border-box}"
     "  body{margin:0;background:var(--bg);color:var(--ink);line-height:1.65;"
     "font-family:system-ui,-apple-system,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif}"
-    "  header.bar{background:var(--blue);color:#fff;padding:22px 28px}"
+    "  header.bar{background:var(--key);color:#fff;padding:22px 28px}"
     "  header.bar h1{margin:0 0 6px;font-size:1.3rem;line-height:1.4}"
     "  .badge{display:inline-block;background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.4);"
     "border-radius:4px;padding:2px 10px;font-size:.8rem}"
@@ -434,11 +455,11 @@
     "  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}"
     "  th{background:#eef0f4;font-weight:600;white-space:nowrap}"
     "  code{background:#eef0f4;border-radius:3px;padding:1px 5px;font-size:.85em}"
-    "  .ok{color:#16610a;font-weight:600}"
-    "  .warn{color:#8a5300;font-weight:600}"
-    "  .critical{color:#b4000f;font-weight:600}"
-    "  .finding{border-left:4px solid #b4000f;background:#fff5f5;padding:12px 16px;margin:12px 0;border-radius:0 6px 6px 0}"
-    "  .finding.clear{border-left-color:#16610a;background:#f2f9f0}"
+    "  .ok{color:var(--ok);font-weight:600}"
+    "  .warn{color:var(--warn);font-weight:600}"
+    "  .critical{color:var(--critical);font-weight:600}"
+    "  .finding{border-left:4px solid var(--critical);background:var(--tint-error);padding:12px 16px;margin:12px 0;border-radius:0 6px 6px 0}"
+    "  .finding.clear{border-left-color:var(--ok);background:var(--tint-ok)}"
     "  .finding h3{margin:0 0 6px;font-size:.95rem}"
     "  .finding p{margin:4px 0;font-size:.86rem}"
     "  footer{max-width:1180px;margin:0 auto;padding:0 20px 40px;font-size:.8rem;color:var(--muted)}"]))
