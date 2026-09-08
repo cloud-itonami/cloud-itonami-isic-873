@@ -52,7 +52,7 @@
   (default `docs/samples/operator-console.html`)."
   (:require [clojure.java.io :as io]
             [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [langgraph.graph :as g]
             [eldercareops.advisor :as advisor]
             [eldercareops.governor :as governor]
@@ -324,12 +324,12 @@
   matched and in which advisor-authored field."
   [proposal]
   (let [fields [:op :summary :rationale :cites :value]
-        blob (str/lower-case (pr-str (select-keys proposal fields)))]
+        blob (str/lower (pr-str (select-keys proposal fields)))]
     (for [term governor/scope-excluded-terms
           :when (str/includes? blob term)]
       {:term term
        :fields (vec (for [f fields
-                          :when (str/includes? (str/lower-case (pr-str (get proposal f))) term)]
+                          :when (str/includes? (str/lower (pr-str (get proposal f))) term)]
                       f))})))
 
 (defn- finding-self-tripping-ops
