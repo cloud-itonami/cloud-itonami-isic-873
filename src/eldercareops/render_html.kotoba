@@ -27,7 +27,7 @@
   PROVENANCE. Every resident id and name comes from
   `eldercareops.store/demo-data`. Every request payload is copied
   verbatim from this repo's own demo driver `eldercareops.sim`
-  (`clojure -M:dev:run`, run and read BEFORE this file was written).
+  (`kbb -M:dev:run`, run and read BEFORE this file was written).
   `resident-99` is the one id deliberately NOT in the directory; it is
   taken from `sim` too and exists only to exercise the governor's
   `resident-unverified` HARD block against an absent record. No
@@ -48,7 +48,7 @@
   HARD rule to the governor without a scenario that reaches it and this
   build stops.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
+  Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [clojure.java.io :as io]
             [clojure.set :as set]
@@ -720,7 +720,7 @@
      "  </section>\n"
      "</main>\n"
      "<footer>\n"
-     "  <p>生成: <code>clojure -M:dev:render-html</code>（<code>eldercareops.render-html</code>）。"
+     "  <p>生成: <code>kbb -M:dev:render-html</code>（<code>eldercareops.render-html</code>）。"
      "入居者 ID・氏名は <code>eldercareops.store/demo-data</code>、リクエスト内容は "
      "<code>eldercareops.sim</code> から取得。タイムスタンプ・乱数を含まず、再実行しても byte 同一。</p>\n"
      "</footer>\n"
